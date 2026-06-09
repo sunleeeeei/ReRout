@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import time
 import random
+import json
 import logging
 from typing import Dict, Any, List, Optional
 
@@ -34,8 +35,13 @@ AB_ENABLED = os.getenv("AB_ENABLED", "false").lower() == "true"
 AB_VARIANT_PCT = float(os.getenv("AB_VARIANT_PCT", "0.1"))  # 10%
 BANDIT_EPSILON = float(os.getenv("BANDIT_EPSILON", "0.1"))  # 10% explore
 
-# Label → Display mapping (friendly keys)
-DEFAULT_MAP = {
+# ---------------------------------------------------------------------------
+# Model mapping: intent label → provider/model
+# Supports env var override via POLICY_MODEL_MAP (JSON format)
+# ---------------------------------------------------------------------------
+
+# Built-in defaults (OpenRouter free models, kept as fallback)
+_BUILTIN_MAP: Dict[str, str] = {
     "code_generation": "qwen3-coder",
     "reasoning": "gpt-oss-20b",
     "summarization": "glm-4.5-air",
@@ -45,7 +51,7 @@ DEFAULT_MAP = {
 }
 
 # Display → provider/model mapping (OpenRouter free models only)
-NAME_TO_MODEL = {
+NAME_TO_MODEL: Dict[str, str] = {
     "minimax-m2": "openrouter/minimax/minimax-m2:free",
     "glm-4.5-air": "openrouter/z-ai/glm-4.5-air:free",
     "qwen3-235b-a22b": "openrouter/qwen/qwen3-235b-a22b:free",
@@ -56,6 +62,27 @@ NAME_TO_MODEL = {
 }
 
 DEFAULT_FALLBACK = "openrouter/minimax/minimax-m2:free"
+
+# Load custom model mapping from environment variable (JSON format)
+# Example: POLICY_MODEL_MAP={"code_generation":"higress/qwen2.5-coder-7b","reasoning":"higress/deepseek-r1-67b"}
+_POLICY_MODEL_MAP_RAW = os.getenv("POLICY_MODEL_MAP", "")
+_POLICY_USE_DIRECT_MAP = False  # When true, DEFAULT_MAP values are already provider/model format
+
+if _POLICY_MODEL_MAP_RAW:
+    try:
+        custom_map = json.loads(_POLICY_MODEL_MAP_RAW)
+        if isinstance(custom_map, dict):
+            # Custom map values are already in provider/model format, skip NAME_TO_MODEL resolution
+            DEFAULT_MAP = custom_map
+            _POLICY_USE_DIRECT_MAP = True
+            logger.info({"event": "custom_model_map_loaded", "map": custom_map})
+        else:
+            DEFAULT_MAP = _BUILTIN_MAP
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning({"event": "invalid_policy_model_map", "error": str(e)})
+        DEFAULT_MAP = _BUILTIN_MAP
+else:
+    DEFAULT_MAP = _BUILTIN_MAP
 
 # Cost tiers (static sample)
 COST_TIERS: Dict[str, List[str]] = {
@@ -98,8 +125,14 @@ def resolve_display_to_model(name: str) -> str:
 
 
 def choose_primary(label: str) -> str:
-    display = DEFAULT_MAP.get(label, "minimax-m2")
-    return resolve_display_to_model(display)
+    model = DEFAULT_MAP.get(label)
+    if model is None:
+        return DEFAULT_FALLBACK
+    # If custom map was loaded, values are already provider/model format
+    if _POLICY_USE_DIRECT_MAP:
+        return model
+    # Built-in map uses display names → resolve via NAME_TO_MODEL
+    return resolve_display_to_model(model)
 
 
 def ab_variant_choice(primary: str, alternatives: List[str]) -> Optional[str]:

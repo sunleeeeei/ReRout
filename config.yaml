@@ -1,62 +1,59 @@
-# Example configuration for RouteLLM MVP
+# ReRout 配置 - 内网 Higress 环境
+# ============================================================================
+# 快速切换指南：
+#   规则模式：pipeline.intent_classifier = http://intent:8000/classify
+#   LLM 模式：pipeline.intent_classifier = http://llm-classifier:9000/classify
+# 修改后执行：docker-compose restart controller
+# ============================================================================
+
 backends:
+  # Higress 后端 - 通过 Higress 统一网关访问内网模型
+  - name: higress
+    prefix: higress/
+    base_url: ${HIGRESS_BASE_URL:-http://localhost:8080/v1}
+    api_key_env: HIGRESS_API_KEY
+    require_api_key: false
+    mock: false
+
+  # Mock 后端 - 测试用，不调真实模型，直接返回 echo 响应
   - name: mock
     prefix: mock/
     mock: true
     require_api_key: false
 
-  - name: openai
-    prefix: openai/
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-    require_api_key: false
-    mock: true
-
-  - name: anthropic
-    prefix: anthropic/
-    base_url: https://api.anthropic.com/v1
-    api_key_env: ANTHROPIC_API_KEY
-    require_api_key: false
-    mock: true
-
-  - name: openrouter
-    prefix: openrouter/
-    base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
-    require_api_key: true
-    mock: false
-
-  - name: ollama
-    prefix: ollama/
-    base_url: http://localhost:11434/v1
-    require_api_key: false
-    mock: true
-
 aliases:
+  # 快捷别名，可通过 model 字段直接指定
   demo: mock/gpt-4o-mini
-  cheap: openai/gpt-4o-mini
-  best: anthropic/claude-sonnet-4-5-20250929
 
 routing_rules:
+  # 意图 → 模型映射（task_router 策略）
+  # 格式：intent_label: backend_prefix/model_name
+  # higress/ 前缀的 model_name 需与 Higress 中注册的模型名一致
   task_router:
-    code_generation: openrouter/qwen/qwen3-coder:free
-    brainstorming: openrouter/meta-llama/llama-3.3-70b-instruct:free
-    summarization: openrouter/z-ai/glm-4.5-air:free
-    reasoning: openrouter/openai/gpt-oss-20b:free
-    chatbot: openrouter/google/gemma-3-27b-it:free
-    open_qa: openrouter/openai/gpt-oss-20b:free
+    code_generation: higress/qwen2.5-coder-7b
+    reasoning: higress/deepseek-r1-67b
+    summarization: higress/qwen2.5-7b
+    brainstorming: higress/qwen2.5-32b
+    chatbot: higress/qwen2.5-7b
+    open_qa: higress/qwen2.5-7b
 
 pipeline:
+  # ---- 意图分类器（切换规则/LLM 模式改这里）----
+  # 规则模式（默认，低延迟 <1ms，准确率中等）
   intent_classifier: http://intent:8000/classify
+  # LLM Sidecar 模式（取消注释下行，注释上行即可切换）
+  # intent_classifier: http://llm-classifier:9000/classify
+
+  # ---- 其他 pipeline 服务 ----
   complexity_estimator: http://complexity:8001/classify
   guardrails: http://guardrails:8002/check
   policy_engine: http://policy:8003/decide
 
-# Memory management configuration
+# 对话记忆管理（可选，测试环境建议关闭）
 memory:
-  enabled: true  # Enable token-based memory stacking
-  max_tokens_per_conversation: 4000  # Maximum tokens per conversation
-  max_total_tokens: 100000  # Maximum total tokens across all conversations
-  pruning_strategy: "fifo"  # "fifo" (oldest first), "lifo" (newest first), "importance" (keep user messages)
-  storage_backend: "memory"  # "memory" (in-memory) or "redis" (persistent)
-  redis_url: "redis://localhost:6379"  # Redis URL if using redis backend
+  enabled: false
+  max_tokens_per_conversation: 4000
+  max_total_tokens: 100000
+  pruning_strategy: "fifo"
+  storage_backend: "memory"
+  redis_url: "redis://redis:6379"

@@ -1,4 +1,7 @@
 services:
+  # ===========================================================================
+  # ReRout Controller - API 网关与路由编排
+  # ===========================================================================
   controller:
     build:
       context: .
@@ -7,9 +10,8 @@ services:
     env_file:
       - .env
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - HIGRESS_BASE_URL=${HIGRESS_BASE_URL:-http://localhost:8080/v1}
+      - HIGRESS_API_KEY=${HIGRESS_API_KEY:-}
     volumes:
       - ./config.yaml:/app/config.yaml
     command: ["python", "-m", "controller.main"]
@@ -28,6 +30,33 @@ services:
       timeout: 3s
       retries: 10
 
+  # ===========================================================================
+  # LLM Classifier Sidecar - 外部 LLM 意图分类（可替代内置 intent 服务）
+  # 切换方式：config.yaml 中将 intent_classifier URL 改为 http://llm-classifier:9000/classify
+  # ===========================================================================
+  llm-classifier:
+    build:
+      context: ./llm-classifier
+    env_file:
+      - .env
+    environment:
+      - LLM_CLASSIFIER_MODE=${LLM_CLASSIFIER_MODE:-mock}
+      - LLM_CLASSIFIER_URL=${LLM_CLASSIFIER_URL:-}
+      - LLM_CLASSIFIER_MODEL=${LLM_CLASSIFIER_MODEL:-qwen2.5-7b}
+      - LLM_CLASSIFIER_API_KEY=${LLM_CLASSIFIER_API_KEY:-}
+      - LLM_CLASSIFIER_TIMEOUT=${LLM_CLASSIFIER_TIMEOUT:-10}
+      - LLM_CLASSIFIER_LABELS=${LLM_CLASSIFIER_LABELS:-code_generation,reasoning,summarization,brainstorming,open_qa,chatbot}
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport urllib.request,sys\ntry:\n  urllib.request.urlopen('http://localhost:9000/health', timeout=2)\n  sys.exit(0)\nexcept Exception:\n  sys.exit(1)\nPY\n"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # ===========================================================================
+  # Intent Classifier - 内置意图分类（规则匹配 / ONNX）
+  # ===========================================================================
   intent:
     build:
       context: .
@@ -47,6 +76,9 @@ services:
       timeout: 3s
       retries: 10
 
+  # ===========================================================================
+  # Complexity Estimator - 复杂度评估
+  # ===========================================================================
   complexity:
     build:
       context: .
@@ -65,6 +97,9 @@ services:
       timeout: 3s
       retries: 10
 
+  # ===========================================================================
+  # Guardrails - 安全护栏（PII 检测）
+  # ===========================================================================
   guardrails:
     build:
       context: .
@@ -77,11 +112,18 @@ services:
       timeout: 3s
       retries: 10
 
+  # ===========================================================================
+  # Policy Engine - 模型选择策略
+  # ===========================================================================
   policy:
     build:
       context: .
     env_file:
       - .env
+    environment:
+      - POLICY_MODEL_MAP=${POLICY_MODEL_MAP:-}
+      - AB_ENABLED=${AB_ENABLED:-false}
+      - BANDIT_EPSILON=${BANDIT_EPSILON:-0.1}
     command: ["python", "policy_engine/app.py"]
     ports:
       - "8003:8003"
@@ -91,6 +133,9 @@ services:
       timeout: 3s
       retries: 10
 
+  # ===========================================================================
+  # Monitoring - Prometheus + Grafana
+  # ===========================================================================
   prometheus:
     image: prom/prometheus:latest
     ports:
@@ -101,8 +146,6 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-    networks:
-      - default
 
   grafana:
     image: grafana/grafana:latest
@@ -111,12 +154,13 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
-    networks:
-      - default
 
+  # ===========================================================================
+  # Redis - 对话记忆存储（可选）
+  # ===========================================================================
   redis:
     image: redis:7-alpine
     ports:
