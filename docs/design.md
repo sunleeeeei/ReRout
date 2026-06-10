@@ -14,16 +14,20 @@
 
 ### 1.1 业务背景
 
-公司内网部署了多个不同参数规模的 LLM 模型，需要根据用户请求的复杂度和任务类型，自动将请求分发到最合适的模型，以降低资源消耗、保障响应质量、控制推理成本。
+公司内网部署了多个不同类型的模型，需要根据用户请求的复杂度和任务类型，自动将 **文本生成请求** 分发到最合适的 LLM，以降低资源消耗、保障响应质量、控制推理成本。
 
 当前模型资源：
 
-| 模型 | 参数量 | 适用场景 |
-|------|--------|---------|
-| Qwen2.5-7B | 7B | 简单问答、摘要、闲聊 |
-| Qwen2.5-Coder-7B | 7B | 代码生成 |
-| Qwen2.5-32B | 32B | 文档撰写、头脑风暴 |
-| DeepSeek-R1-671B | 671B | 复杂推理、多步分析、架构设计 |
+| 模型 | 类型 | 适用场景 |
+|------|------|---------|
+| qwen3.6-35b-a3b | 文本生成 LLM（MoE 35B/3B 激活） | 摘要、知识问答、轻量任务 |
+| qwen3-4b | 文本生成 LLM | 闲聊、简单问答 |
+| qwen2.5-72b-instruct | 文本生成 LLM | 复杂生成、创意写作、头脑风暴 |
+| deepseek-v4-flash | 文本生成 LLM | 逻辑推理、多步分析 |
+| glm-5.1-cloud | 文本生成 LLM | 代码生成、编程辅助 |
+| glm-4.5v-fp8 | 视觉 LLM | 图像理解、图文问答 |
+| bge-m3 | Embedding | 向量化、语义检索 |
+| bge-reranker-v2-m3 | Rerank | 重排序、搜索优化 |
 
 ### 1.2 约束条件
 
@@ -97,9 +101,73 @@ RouteLLM 确实提供了 3 个预训练路由模型（BERT、MF、Causal LLM）�
 ```
                               ┌─────────────────────────────────────────┐
                               │            用户 / 业务系统              │
-                              └────────────────┬────────────────────────┘
-                                               │
-                              ┌────────────────▼────────────────────────┐
+                              └──────────────┬──────────────────────────┘
+                                             │
+                              ┌──────────────▼──────────────────────────┐
+                              │        ReRout Controller (:8084)        │
+                              │   OpenAI 兼容 API / 路由编排 / 代理转发   │
+                              └──────────────┬──────────────────────────┘
+                                             │
+                              ┌──────────────▼──────────────────────────┐
+                              │            请求分流判断                   │
+                              │                                         │
+                              │  model 为空？→ 智能路由管线              │
+                              │  model 已指定？→ 直接转发到 Higress      │
+                              └──────────────┬──────────────────────────┘
+```
+
+### 2.1.1 流量分流策略
+
+不同类型的请求走不同路径，ReRout **只对文本生成 LLM 做智能路由**：
+
+```
+用户请求
+  │
+  ├── Chat/Completion（model 为空）──→ ReRout 智能路由 ──→ Higress ──→ 目标 LLM
+  │                                    意图分类 + 策略决策
+  │
+  ├── Chat/Completion（model 已指定）──→ ReRout 直接转发 ──→ Higress ──→ 指定 LLM
+  │                                      不触发路由管线
+  │
+  ├── Vision（图片 + 文本）──────────→ ReRout 直接转发 ──→ Higress ──→ glm-4.5v-fp8
+  │                                      客户端指定视觉模型
+  │
+  ├── Embedding ─────────────────────→ 直接调 Higress ──→ bge-m3
+  │                                      不经过 ReRout
+  │
+  └── Rerank ────────────────────────→ 直接调 Higress ──→ bge-reranker-v2-m3
+                                         不经过 ReRout
+```
+
+为什么 Embedding/Rerank 不走 ReRout 路由：
+
+| 请求类型 | 走路由有意义吗 | 理由 |
+|---------|--------------|------|
+| **Chat/Completion（未指定模型）** | ✅ 走路由 | 根据内容智能选择最合适的 LLM |
+| **Chat/Completion（已指定模型）** | ❌ 直传 | 用户/应用已明确知道要用哪个模型 |
+| **Vision（图片请求）** | ❌ 指定模型 | 当前不支持图像路由：`Message.content` 仅接受 `str`，不支持 OpenAI 多模态 list 格式；且路由管线（意图分类等）仅处理文本。需客户端指定 model 直传视觉模型 |
+| **Embedding** | ❌ 不走路由 | 模型唯一、维度固定，不存在"选哪个模型"的问题 |
+| **Rerank** | ❌ 不走路由 | 功能单一，直接指定模型即可 |
+
+ReRout Controller 已天然支持这种分流——`model` 为空触发路由管线，`model` 已指定则直接转发：
+
+```python
+# controller/main.py 核心逻辑
+provided_model = (request.model or "").strip()
+
+if not provided_model:
+    # model 为空 → 触发智能路由管线
+    routing_explain = await run_pipeline(...)
+    resolved_model = routing_explain.get("chosen")
+else:
+    # model 已指定 → 直接转发，不走路由
+    resolved_model = resolve_alias(provided_model, CONFIG)
+```
+
+### 2.1.2 完整服务架构
+
+```
+                              ┌─────────────────────────────────────────┐
                               │        ReRout Controller (:8084)        │
                               │   OpenAI 兼容 API / 路由编排 / 代理转发   │
                               └────────────────┬────────────────────────┘
@@ -130,9 +198,16 @@ RouteLLM 确实提供了 3 个预训练路由模型（BERT、MF、Causal LLM）�
                     ┌──────────────┬────────────┼────────────┬──────────────┐
                     ▼              ▼            ▼            ▼              ▼
               ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-              │ Qwen2.5  │  │ Qwen2.5  │  │ Qwen2.5  │  │ DeepSeek │  │  其他     │
-              │   7B     │  │ Coder 7B │  │   32B    │  │  R1 671B │  │  模型     │
+              │ qwen3.6  │  │ qwen3-4b │  │ qwen2.5  │  │deepseek  │  │ glm-5.1  │
+              │ -35b-a3b │  │          │  │ -72b     │  │-v4-flash │  │ -cloud   │
+              │ (轻量任务)│  │ (闲聊)   │  │ (复杂生成)│  │ (逻辑推理)│  │ (代码生成)│
               └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘
+
+              ┌──────────┐  ┌──────────┐
+              │glm-4.5v  │  │  bge-m3  │  ← 不经过 ReRout，直接调 Higress
+              │ -fp8     │  │(Embedding)│     Embedding / Rerank 按模型名直连
+              │ (视觉)   │  └──────────┘
+              └──────────┘
 ```
 
 ### 2.2 组件职责
@@ -168,11 +243,11 @@ RouteLLM 确实提供了 3 个预训练路由模型（BERT、MF、Causal LLM）�
    → {"passed": true}
 
 6. Policy Engine 做最终模型选择
-   intent=code_generation + complexity=medium → 选择 higress-qwen/qwen2.5-coder-7b
+   intent=code_generation + complexity=medium → 选择 higress/glm-5.1-cloud
 
 7. Controller 改写请求 model 字段，转发到 Higress
-   原始 model="" → 改写 model="qwen2.5-coder-7b"
-   使用 higress-qwen backend 配置的 API Key 认证
+   原始 model="" → 改写 model="glm-5.1-cloud"
+   使用 higress backend 配置的 API Key 认证
 
 8. Higress 路由到实际的模型服务
 
@@ -222,6 +297,14 @@ Higress 为不同模型分配不同的 API Key。通过拆分 backend 实现：
 
 ```yaml
 backends:
+  # 如果所有模型共用一个 API Key，只需一个 backend
+  - name: higress
+    prefix: higress/
+    base_url: http://higress:8080/v1
+    api_key_env: HIGRESS_API_KEY
+    require_api_key: true
+
+  # 如果不同模型需要不同 API Key，按供应商拆分
   - name: higress-qwen
     prefix: higress-qwen/
     base_url: http://higress:8080/v1
@@ -233,17 +316,15 @@ backends:
     base_url: http://higress:8080/v1
     api_key_env: HIGRESS_DEEPSEEK_API_KEY
     require_api_key: true
-
-routing_rules:
-  task_router:
-    code_generation: higress-qwen/qwen2.5-coder-7b
-    reasoning: higress-deepseek/deepseek-r1-67b
-    chatbot: higress-qwen/qwen2.5-7b
 ```
 
-路由后 `higress-qwen/qwen2.5-coder-7b` 被拆分为：
-- 前缀 `higress-qwen/` → 匹配对应 backend，使用 `HIGRESS_QWEN_API_KEY`
-- 模型名 `qwen2.5-coder-7b` → 作为 `model` 字段发给 Higress
+路由后 `higress/glm-5.1-cloud` 被拆分为：
+- 前缀 `higress/` → 匹配对应 backend，使用 `HIGRESS_API_KEY`
+- 模型名 `glm-5.1-cloud` → 作为 `model` 字段发给 Higress
+
+路由后 `higress-deepseek/deepseek-v4-flash` 被拆分为：
+- 前缀 `higress-deepseek/` → 匹配对应 backend，使用 `HIGRESS_DEEPSEEK_API_KEY`
+- 模型名 `deepseek-v4-flash` → 作为 `model` 字段发给 Higress
 
 ### 2.6 Higress 对接
 
@@ -309,9 +390,13 @@ vim .env
 # Higress 地址（必填）
 HIGRESS_BASE_URL=http://your-higress:8080/v1
 
-# Higress API Key（按模型供应商配置）
-HIGRESS_QWEN_API_KEY=sk-qwen-xxxxx
-HIGRESS_DEEPSEEK_API_KEY=sk-deepseek-xxxxx
+# Higress API Key
+# 方式一：所有模型共用一个 Key
+HIGRESS_API_KEY=sk-xxxxx
+# 方式二：按模型供应商分配不同 Key
+# HIGRESS_QWEN_API_KEY=sk-qwen-xxxxx
+# HIGRESS_DEEPSEEK_API_KEY=sk-deepseek-xxxxx
+# HIGRESS_GLM_API_KEY=sk-glm-xxxxx
 
 # LLM Sidecar 模式（先 mock 验证流程）
 LLM_CLASSIFIER_MODE=mock
@@ -319,7 +404,7 @@ LLM_CLASSIFIER_MODE=mock
 # 后续接入真实模型时改为：
 # LLM_CLASSIFIER_MODE=llm
 # LLM_CLASSIFIER_URL=http://your-higress:8080/v1/chat/completions
-# LLM_CLASSIFIER_MODEL=qwen2.5-7b
+# LLM_CLASSIFIER_MODEL=qwen3.6-35b-a3b
 ```
 
 ### 3.4 配置路由规则
@@ -328,17 +413,29 @@ LLM_CLASSIFIER_MODE=mock
 
 ```yaml
 backends:
-  - name: higress-qwen
-    prefix: higress-qwen/
+  # 所有模型通过同一个 Higress 后端（共用 API Key）
+  - name: higress
+    prefix: higress/
     base_url: ${HIGRESS_BASE_URL}
-    api_key_env: HIGRESS_QWEN_API_KEY
+    api_key_env: HIGRESS_API_KEY
     require_api_key: true
 
-  - name: higress-deepseek
-    prefix: higress-deepseek/
-    base_url: ${HIGRESS_BASE_URL}
-    api_key_env: HIGRESS_DEEPSEEK_API_KEY
-    require_api_key: true
+  # 如需按供应商分配不同 Key，拆分为多个 backend：
+  # - name: higress-qwen
+  #   prefix: higress-qwen/
+  #   base_url: ${HIGRESS_BASE_URL}
+  #   api_key_env: HIGRESS_QWEN_API_KEY
+  #   require_api_key: true
+  # - name: higress-deepseek
+  #   prefix: higress-deepseek/
+  #   base_url: ${HIGRESS_BASE_URL}
+  #   api_key_env: HIGRESS_DEEPSEEK_API_KEY
+  #   require_api_key: true
+  # - name: higress-glm
+  #   prefix: higress-glm/
+  #   base_url: ${HIGRESS_BASE_URL}
+  #   api_key_env: HIGRESS_GLM_API_KEY
+  #   require_api_key: true
 
   - name: mock
     prefix: mock/
@@ -347,12 +444,12 @@ backends:
 
 routing_rules:
   task_router:
-    code_generation: higress-qwen/qwen2.5-coder-7b
-    reasoning: higress-deepseek/deepseek-r1-67b
-    summarization: higress-qwen/qwen2.5-7b
-    brainstorming: higress-qwen/qwen2.5-32b
-    chatbot: higress-qwen/qwen2.5-7b
-    open_qa: higress-qwen/qwen2.5-7b
+    code_generation: higress/glm-5.1-cloud            # 代码生成 → GLM 5.1（编码能力强）
+    reasoning: higress/deepseek-v4-flash               # 逻辑推理 → DeepSeek V4 Flash
+    summarization: higress/qwen3.6-35b-a3b             # 摘要 → Qwen 3.6 MoE（轻量任务）
+    brainstorming: higress/qwen2.5-72b-instruct        # 头脑风暴 → Qwen 2.5 72B（大模型创意）
+    chatbot: higress/qwen3-4b                          # 闲聊 → Qwen 3 4B（最轻量）
+    open_qa: higress/qwen3.6-35b-a3b                   # 开放问答 → Qwen 3.6 MoE（中等任务）
 ```
 
 ### 3.5 启动服务
@@ -521,15 +618,10 @@ metadata:
 data:
   config.yaml: |
     backends:
-      - name: higress-qwen
-        prefix: higress-qwen/
+      - name: higress
+        prefix: higress/
         base_url: http://higress.higress-system:8080/v1
-        api_key_env: HIGRESS_QWEN_API_KEY
-        require_api_key: true
-      - name: higress-deepseek
-        prefix: higress-deepseek/
-        base_url: http://higress.higress-system:8080/v1
-        api_key_env: HIGRESS_DEEPSEEK_API_KEY
+        api_key_env: HIGRESS_API_KEY
         require_api_key: true
       - name: mock
         prefix: mock/
@@ -541,12 +633,12 @@ data:
 
     routing_rules:
       task_router:
-        code_generation: higress-qwen/qwen2.5-coder-7b
-        reasoning: higress-deepseek/deepseek-r1-67b
-        summarization: higress-qwen/qwen2.5-7b
-        brainstorming: higress-qwen/qwen2.5-32b
-        chatbot: higress-qwen/qwen2.5-7b
-        open_qa: higress-qwen/qwen2.5-7b
+        code_generation: higress/glm-5.1-cloud
+        reasoning: higress/deepseek-v4-flash
+        summarization: higress/qwen3.6-35b-a3b
+        brainstorming: higress/qwen2.5-72b-instruct
+        chatbot: higress/qwen3-4b
+        open_qa: higress/qwen3.6-35b-a3b
 
     pipeline:
       intent_classifier: http://intent:8000/classify
@@ -570,8 +662,11 @@ metadata:
   namespace: llm-router
 type: Opaque
 stringData:
-  HIGRESS_QWEN_API_KEY: "sk-qwen-xxxxx"
-  HIGRESS_DEEPSEEK_API_KEY: "sk-deepseek-xxxxx"
+  HIGRESS_API_KEY: "sk-xxxxx"
+  # 如按供应商分配不同 Key，取消注释以下行并删除上行
+  # HIGRESS_QWEN_API_KEY: "sk-qwen-xxxxx"
+  # HIGRESS_DEEPSEEK_API_KEY: "sk-deepseek-xxxxx"
+  # HIGRESS_GLM_API_KEY: "sk-glm-xxxxx"
   LLM_CLASSIFIER_API_KEY: ""
 ```
 
@@ -734,7 +829,7 @@ spec:
             - name: LLM_CLASSIFIER_URL
               value: "http://higress.higress-system:8080/v1/chat/completions"
             - name: LLM_CLASSIFIER_MODEL
-              value: "qwen2.5-7b"
+              value: "qwen3.6-35b-a3b"
           envFrom:
             - secretRef:
                 name: rerout-secrets
@@ -902,7 +997,7 @@ spec:
             - containerPort: 8003
           env:
             - name: POLICY_MODEL_MAP
-              value: '{"code_generation":"higress-qwen/qwen2.5-coder-7b","reasoning":"higress-deepseek/deepseek-r1-67b","summarization":"higress-qwen/qwen2.5-7b","brainstorming":"higress-qwen/qwen2.5-32b","open_qa":"higress-qwen/qwen2.5-7b","chatbot":"higress-qwen/qwen2.5-7b"}'
+              value: '{"code_generation":"higress/glm-5.1-cloud","reasoning":"higress/deepseek-v4-flash","summarization":"higress/qwen3.6-35b-a3b","brainstorming":"higress/qwen2.5-72b-instruct","open_qa":"higress/qwen3.6-35b-a3b","chatbot":"higress/qwen3-4b"}'
           resources:
             requests:
               cpu: "100m"
@@ -1029,11 +1124,13 @@ spec:
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `HIGRESS_BASE_URL` | - | Higress OpenAI 兼容 API 地址 |
-| `HIGRESS_QWEN_API_KEY` | - | Qwen 系列模型的 API Key |
-| `HIGRESS_DEEPSEEK_API_KEY` | - | DeepSeek 系列模型的 API Key |
+| `HIGRESS_API_KEY` | - | Higress 统一 API Key（所有模型共用） |
+| `HIGRESS_QWEN_API_KEY` | - | Qwen 系列模型的 API Key（按供应商拆分时使用） |
+| `HIGRESS_DEEPSEEK_API_KEY` | - | DeepSeek 系列模型的 API Key（按供应商拆分时使用） |
+| `HIGRESS_GLM_API_KEY` | - | GLM 系列模型的 API Key（按供应商拆分时使用） |
 | `LLM_CLASSIFIER_MODE` | mock | 分类模式：mock / llm |
 | `LLM_CLASSIFIER_URL` | - | LLM 分类服务的 API 地址 |
-| `LLM_CLASSIFIER_MODEL` | qwen2.5-7b | 分类使用的模型名 |
+| `LLM_CLASSIFIER_MODEL` | qwen3.6-35b-a3b | 分类使用的模型名 |
 | `LLM_CLASSIFIER_API_KEY` | - | 分类服务 API Key |
 | `LLM_CLASSIFIER_TIMEOUT` | 10 | 分类请求超时（秒） |
 | `LLM_CLASSIFIER_LABELS` | code_generation,reasoning,... | 分类标签（逗号分隔） |
@@ -1048,12 +1145,12 @@ spec:
 ```yaml
 routing_rules:
   task_router:
-    code_generation: higress-qwen/qwen2.5-coder-7b    # 代码生成 → Qwen Coder
-    reasoning: higress-deepseek/deepseek-r1-67b        # 逻辑推理 → DeepSeek R1
-    summarization: higress-qwen/qwen2.5-7b            # 摘要 → Qwen 7B
-    brainstorming: higress-qwen/qwen2.5-32b           # 头脑风暴 → Qwen 32B
-    chatbot: higress-qwen/qwen2.5-7b                  # 闲聊 → Qwen 7B
-    open_qa: higress-qwen/qwen2.5-7b                  # 开放问答 → Qwen 7B
+    code_generation: higress/glm-5.1-cloud              # 代码生成 → GLM 5.1（编码能力强）
+    reasoning: higress/deepseek-v4-flash                 # 逻辑推理 → DeepSeek V4 Flash
+    summarization: higress/qwen3.6-35b-a3b               # 摘要 → Qwen 3.6 MoE（轻量任务）
+    brainstorming: higress/qwen2.5-72b-instruct          # 头脑风暴 → Qwen 2.5 72B（创意生成）
+    chatbot: higress/qwen3-4b                            # 闲聊 → Qwen 3 4B（最轻量）
+    open_qa: higress/qwen3.6-35b-a3b                     # 开放问答 → Qwen 3.6 MoE（中等任务）
 ```
 
 ### C. 监控指标说明

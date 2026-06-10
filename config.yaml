@@ -8,12 +8,30 @@
 
 backends:
   # Higress 后端 - 通过 Higress 统一网关访问内网模型
+  # 方式一：所有模型共用一个 API Key（推荐，简单）
   - name: higress
     prefix: higress/
     base_url: ${HIGRESS_BASE_URL:-http://localhost:8080/v1}
     api_key_env: HIGRESS_API_KEY
     require_api_key: false
     mock: false
+
+  # 方式二：按模型供应商分配不同 Key（取消注释以下配置，注释上方 higress）
+  # - name: higress-qwen
+  #   prefix: higress-qwen/
+  #   base_url: ${HIGRESS_BASE_URL:-http://localhost:8080/v1}
+  #   api_key_env: HIGRESS_QWEN_API_KEY
+  #   require_api_key: true
+  # - name: higress-deepseek
+  #   prefix: higress-deepseek/
+  #   base_url: ${HIGRESS_BASE_URL:-http://localhost:8080/v1}
+  #   api_key_env: HIGRESS_DEEPSEEK_API_KEY
+  #   require_api_key: true
+  # - name: higress-glm
+  #   prefix: higress-glm/
+  #   base_url: ${HIGRESS_BASE_URL:-http://localhost:8080/v1}
+  #   api_key_env: HIGRESS_GLM_API_KEY
+  #   require_api_key: true
 
   # Mock 后端 - 测试用，不调真实模型，直接返回 echo 响应
   - name: mock
@@ -29,13 +47,20 @@ routing_rules:
   # 意图 → 模型映射（task_router 策略）
   # 格式：intent_label: backend_prefix/model_name
   # higress/ 前缀的 model_name 需与 Higress 中注册的模型名一致
+  #
+  # 模型选择逻辑：
+  #   glm-5.1-cloud    → 编码能力强，用于代码生成
+  #   deepseek-v4-flash → 推理能力强，用于逻辑分析
+  #   qwen3.6-35b-a3b  → MoE 35B/3B 激活，轻量高效，用于摘要和问答
+  #   qwen2.5-72b      → 大模型，用于创意写作
+  #   qwen3-4b         → 最轻量，用于简单闲聊
   task_router:
-    code_generation: higress/qwen2.5-coder-7b
-    reasoning: higress/deepseek-r1-67b
-    summarization: higress/qwen2.5-7b
-    brainstorming: higress/qwen2.5-32b
-    chatbot: higress/qwen2.5-7b
-    open_qa: higress/qwen2.5-7b
+    code_generation: higress/glm-5.1-cloud            # 代码生成 → GLM 5.1（编码能力强）
+    reasoning: higress/deepseek-v4-flash               # 逻辑推理 → DeepSeek V4 Flash
+    summarization: higress/qwen3.6-35b-a3b             # 摘要 → Qwen 3.6 MoE（轻量任务）
+    brainstorming: higress/qwen2.5-72b-instruct        # 头脑风暴 → Qwen 2.5 72B（创意生成）
+    chatbot: higress/qwen3-4b                          # 闲聊 → Qwen 3 4B（最轻量）
+    open_qa: higress/qwen3.6-35b-a3b                   # 开放问答 → Qwen 3.6 MoE（中等任务）
 
 pipeline:
   # ---- 意图分类器（切换规则/LLM 模式改这里）----
