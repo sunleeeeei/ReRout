@@ -3,6 +3,7 @@
 ## 目录
 
 - [第一章 需求与选型分析](#第一章-需求与选型分析)
+  - [1.7 基于 ReRout 的定制改动](#17-基于-rerout-的定制改动)
 - [第二章 架构设计](#第二章-架构设计)
 - [第三章 测试环境部署（Docker Compose）](#第三章-测试环境部署docker-compose)
 - [第四章 生产环境部署（Kubernetes）](#第四章-生产环境部署kubernetes)
@@ -91,6 +92,41 @@ RouteLLM 确实提供了 3 个预训练路由模型（BERT、MF、Causal LLM）�
 5. **模式灵活切换**：规则模式（<1ms）和 LLM Sidecar 模式（~200ms）通过配置切换
 6. **多 API Key 支持**：不同模型使用不同密钥，通过多 backend 配置实现
 7. **微服务架构**：天然适配 K8s，每个服务可独立升级
+
+### 1.7 基于 ReRout 的定制改动
+
+ReRout 开源项目（[github.com/sunleeeeei/ReRout](https://github.com/sunleeeeei/ReRout)）原生面向 OpenRouter 公网服务，直接部署无法适配内网 Higress 环境。以下是基于 ReRout 进行的定制改动：
+
+#### 新增服务
+
+| 新增 | 文件 | 说明 |
+|------|------|------|
+| **LLM Classifier Sidecar** | `llm-classifier/` 目录（新增） | 独立的意图分类服务，支持 mock 模式（测试流程）和 LLM 模式（调用 Higress 后的小模型做中文意图分类）。内置中文分类 prompt，替代 ReRout 原生的英文关键词规则分类 |
+
+#### 源码改动
+
+| 文件 | 改动 | 原因 |
+|------|------|------|
+| `policy_engine/app.py` | 新增 `POLICY_MODEL_MAP` 环境变量支持（+43 行） | 原生 Policy Engine 硬编码 OpenRouter 模型映射，无法路由到内网 Higress 模型。改动后支持通过环境变量覆盖默认映射，设了 `POLICY_MODEL_MAP` 就走内网模型，没设就保留原生的 OpenRouter 兜底 |
+
+#### 配置改动
+
+| 文件 | 改动 | 原因 |
+|------|------|------|
+| `config.yaml` | 重写 backends、routing_rules、pipeline 配置 | 原生配置指向 OpenRouter，改为指向内网 Higress |
+| `docker-compose.yml` | 新增 llm-classifier 服务定义 | 部署 LLM Sidecar 分类服务 |
+| `.env.example` | 新增 Higress 相关环境变量文档 | 记录内网部署所需的环境变量 |
+
+#### 未改动的组件
+
+以下组件为 ReRout 原生代码，**未做任何修改**：
+
+- `controller/` — API 编排、路由调度、代理转发
+- `classifiers/intent/` — 规则模式意图分类
+- `classifiers/complexity/` — 复杂度评估
+- `guardrails/` — 安全护栏（PII 检测）
+- `chat-ui/` — Playground 界面
+- `monitoring/` — Prometheus 配置
 
 ---
 
