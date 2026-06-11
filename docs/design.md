@@ -45,11 +45,11 @@
 
 经过筛选，以下 4 个方案进入详细评估：
 
-| 维度 | NVIDIA LLM Router v1 | NVIDIA LLM Router v2 | LLMRouter (ulab-uiuc) | RouteLLM (lm-sys) | **ReRout + Sidecar** |
+| 维度 | NVIDIA LLM Router v1 | NVIDIA LLM Router v2 | LLMRouter (ulab-uiuc) | RouteLLM (lm-sys) | **ReRout** |
 |------|---------------------|---------------------|----------------------|-------------------|---------------------|
-| 分类模型 | BERT（预训练） | Qwen 1.7B（LLM） | 16+ 算法可选 | BERT/MF/SW（预训练） | 规则 / LLM Sidecar |
+| 分类模型 | BERT（预训练） | Qwen 1.7B（LLM） | 16+ 算法可选 | BERT/MF/SW（预训练） | 规则匹配（内置） |
 | GPU 要求 | ✅ 必须（Triton） | ✅ 必须（16GB） | ❌ CPU 可跑 | BERT: CPU / MF: 需 OpenAI API | ❌ CPU 可跑 |
-| 分类延迟 | ~5ms（GPU） | ~90ms（GPU） | 5ms-2s | BERT: ~20ms | 规则: <1ms / Sidecar: ~200ms |
+| 分类延迟 | ~5ms（GPU） | ~90ms（GPU） | 5ms-2s | BERT: ~20ms | <1ms（规则模式） |
 | 代理转发 | ✅ 内置 Rust 代理 | ❌ 仅分类，不转发 | ⚠️ 需 OpenClaw 包装 | ✅ 通过 LiteLLM | ✅ Controller 内置 |
 | 安全护栏 | ❌ | ❌ | ❌ | ❌ | ✅ PII 检测 |
 | 监控体系 | ❌ | ❌ | ❌ | ❌ | ✅ Prometheus + Grafana |
@@ -59,7 +59,7 @@
 | Higress 对接 | ⚠️ 需写代码 | ⚠️ 需写转发层 | ⚠️ 需写代码 | ⚠️ 需配置 LiteLLM | ✅ config.yaml 纯配置 |
 | 内网部署 | ⚠️ NGC 镜像问题 | ✅ Docker | ✅ pip install | ⚠️ MF/SW 需 OpenAI | ✅ Docker / K8s |
 | 项目成熟度 | v1 稳定 / v2 Experimental | v2 Experimental | Alpha | 学术框架 | 微服务架构完善 |
-| 中文支持 | ⚠️ 英文 BERT | ✅ Qwen | ⚠️ 英文 benchmark 为主 | ⚠️ 英文 Arena 数据 | ✅ LLM Sidecar 调中文模型 |
+| 中文支持 | ⚠️ 英文 BERT | ✅ Qwen | ⚠️ 英文 benchmark 为主 | ⚠️ 英文 Arena 数据 | ⚠️ 英文关键词规则 |
 | 路由粒度 | 13 类意图 | 5 类意图 | 取决于算法 | 强/弱 二选一 | **6 意图 × 3 复杂度 → 任意模型** |
 
 ### 1.4 淘汰原因
@@ -83,15 +83,16 @@ RouteLLM 确实提供了 3 个预训练路由模型（BERT、MF、Causal LLM）�
 
 ### 1.6 最终选型
 
-**ReRout + LLM Sidecar**，理由：
+**ReRout**（开源项目），理由：
 
 1. **零 GPU 依赖**：全链路 CPU 可运行，GPU 资源全部留给业务模型
 2. **生产功能完整**：监控、安全护栏、降级策略、A/B 测试、反馈闭环开箱即用
 3. **Higress 纯配置对接**：修改 `config.yaml` 即可，无需写适配代码
 4. **路由粒度精细**：6 种意图 × 3 级复杂度，可路由到任意数量的模型
-5. **模式灵活切换**：规则模式（<1ms）和 LLM Sidecar 模式（~200ms）通过配置切换
-6. **多 API Key 支持**：不同模型使用不同密钥，通过多 backend 配置实现
-7. **微服务架构**：天然适配 K8s，每个服务可独立升级
+5. **多 API Key 支持**：不同模型使用不同密钥，通过多 backend 配置实现
+6. **微服务架构**：天然适配 K8s，每个服务可独立升级
+
+> **注意**：ReRout 原生的意图分类仅支持英文关键词规则匹配，中文分类准确率有限。我们在 ReRout 基础上新增了 LLM Classifier Sidecar 服务（见 1.7 节），通过调用内网小模型实现中文语义级意图分类，作为可选的增强方案。
 
 ### 1.7 基于 ReRout 的定制改动
 
@@ -101,7 +102,28 @@ ReRout 开源项目（[github.com/sunleeeeei/ReRout](https://github.com/sunleeee
 
 | 新增 | 文件 | 说明 |
 |------|------|------|
-| **LLM Classifier Sidecar** | `llm-classifier/` 目录（新增） | 独立的意图分类服务，支持 mock 模式（测试流程）和 LLM 模式（调用 Higress 后的小模型做中文意图分类）。内置中文分类 prompt，替代 ReRout 原生的英文关键词规则分类 |
+| **LLM Classifier Sidecar** | `llm-classifier/` 目录（新增） | 见下方详细说明 |
+
+**为什么需要新增 LLM Classifier Sidecar：**
+
+ReRout 原生的意图分类依赖**英文关键词规则匹配**或**预训练的小模型**（如 BERT/ONNX），这些方案存在两个问题：
+
+1. **中文分类准确率低**：关键词规则仅覆盖英文（`def`、`import`、`code` 等），中文请求几乎全部被默认归类为 `chatbot`
+2. **预训练模型需额外训练**：ONNX/BERT 模型基于英文数据训练，要支持中文分类需要自行准备中文训练数据并微调，成本高
+
+新增的 LLM Classifier Sidecar 直接**复用内网已有的 LLM**（通过 Higress 调用 qwen3.6-35b-a3b 等模型），用 prompt 引导大模型做意图分类，无需训练任何模型。代价是多一次 LLM 调用（~200ms 延迟），换来中文语义级的分类能力。
+
+```
+原生 ReRout 分类方式：
+  英文关键词规则 / 预训练小模型（需训练）→ 分类意图
+
+新增 Sidecar 分类方式：
+  内网 LLM（无需训练，直接用 prompt 分类）→ 分类意图
+```
+
+该服务支持两种模式：
+- **mock 模式**：不调真实模型，返回固定分类结果，用于验证部署流程是否通畅
+- **llm 模式**：调用 Higress 后的 LLM 做真实分类，内置中文分类 prompt
 
 #### 源码改动
 
